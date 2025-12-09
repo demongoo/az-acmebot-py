@@ -1,0 +1,6 @@
+.idea/
+.venv/
+data/*
+logs/*
+config.yaml
+docker-compose*.yml

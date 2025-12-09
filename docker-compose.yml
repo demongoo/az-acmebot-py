@@ -1,0 +1,11 @@
+services:
+  az-acmebot:
+    build: .
+    container_name: az-acmebot
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ./logs:/app/logs
