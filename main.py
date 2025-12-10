@@ -1,5 +1,9 @@
-from typing import Annotated
-from datetime import datetime, timedelta
+import asyncio
+from functools import cache
+from typing import Annotated, Optional
+import datetime
+from datetime import datetime as dt, timedelta
+from secrets import compare_digest
 
 from fastapi import Depends, FastAPI, HTTPException, status, Request
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -9,12 +13,15 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.backends import default_backend
+
 from config import settings
 from logger import logger
-
-from secrets import compare_digest
-
+from service.acme import ACMEService
 from service.keyvault import KeyVaultService
+from service.dns import DNSService
 
 # initialize templates
 templates = Jinja2Templates(directory="templates")
@@ -36,6 +43,38 @@ logger.info(f"Initialized Azure Credential: {azure_credential}")
 keyvault_service = KeyVaultService(credential=azure_credential, vault_url=settings.azure_keyvault_url)
 logger.info(f"Initialized Key Vault Service for vault: {settings.azure_keyvault_url}")
 
+# initialize dns service
+if settings.dns_zone_name and settings.dns_zone_resource_group and settings.azure_subscription_id:
+    dns_service = DNSService(
+        credential=azure_credential,
+        subscription_id=settings.azure_subscription_id,
+        resource_group=settings.dns_zone_resource_group,
+        zone_name=settings.dns_zone_name
+    )
+    logger.info(f"Initialized DNS Service for zone: {settings.dns_zone_name}")
+else:
+    dns_service = None
+    logger.info("DNS Service not initialized (missing configuration)")
+
+# acme factory
+@cache
+def acme_provider_factory(acme_code: str) -> Optional[ACMEService]:
+    match acme_code:
+        case 'letsencrypt':
+            acme_server = 'https://acme-v02.api.letsencrypt.org/directory'
+            acme_email = settings.acme_letsencrypt_email or settings.acme_email
+        case _:
+            logger.warning(f"Unknown ACME provider code: {acme_code}")
+            return None
+
+    if acme_email:
+        logger.info(f'Initializing ACME provider {acme_code} with email {acme_email}')
+        return ACMEService(acme_server=acme_server, acme_email=acme_email)
+    else:
+        logger.warning(f"ACME email not configured, cannot initialize provider {acme_code}")
+        return None
+
+def acme_f
 
 # background task
 async def process_renewals():
@@ -55,7 +94,7 @@ async def lifespan(_: FastAPI):
     scheduler.add_job(
         process_renewals, "interval", coalesce=True,
         minutes=settings.process_interval,
-        next_run_time=datetime.now() + timedelta(minutes=settings.process_first_run_delay)
+        next_run_time=dt.now() + timedelta(minutes=settings.process_first_run_delay)
     )
     scheduler.start()
 
@@ -63,6 +102,10 @@ async def lifespan(_: FastAPI):
 
     logger.info("Stopping scheduler")
     scheduler.shutdown()
+
+    logger.info("Stopping services")
+    await keyvault_service.close()
+    await azure_credential.close()
 
 
 # FastAPI application instance
@@ -99,16 +142,62 @@ async def healthcheck() -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request, _: None = Depends(verify_credentials)):
+    await dns_service.create_txt_record("test.blabla", "blablabla")
+
     certs_props = await keyvault_service.list_certificates()
+
+    # Fetch full details for all certificates in parallel
+    tasks = [keyvault_service.get_certificate(c.name) for c in certs_props]
+    cert_bundles = await asyncio.gather(*tasks)
+
     certs = []
-    for c in certs_props:
+    for prop, bundle in zip(certs_props, cert_bundles):
+        domain = "?"
+        issuer = "? / ?"
+
+        if bundle.cer:
+            try:
+                x509_cert = x509.load_der_x509_certificate(bundle.cer, default_backend())
+
+                # Extract Subject CN
+                subject_cn = x509_cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+                if subject_cn:
+                    domain = subject_cn[0].value
+
+                # Extract Issuer CN and Organization
+                issuer_cn = x509_cert.issuer.get_attributes_for_oid(NameOID.COMMON_NAME)
+                issuer_cn_str = issuer_cn[0].value if issuer_cn else '?'
+
+                issuer_org = x509_cert.issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+                issuer_org_str = issuer = issuer_org[0].value if issuer_org else '?'
+
+                issuer = f"{issuer_cn_str}  / {issuer_org_str}"
+            except Exception as e:
+                logger.error(f"Error parsing cert {prop.name}: {e}")
+
+        # status class
+        if prop.expires_on:
+            days_to_expiry = (prop.expires_on - dt.now(datetime.UTC)).days
+            if days_to_expiry < 0:
+                status_class = "expired"
+            elif days_to_expiry <= settings.renewal_days_before_expiry:
+                status_class = "soon"
+            else:
+                status_class = "valid"
+        else:
+            status_class = "unknown"
+
+        logger.debug(repr(prop.expires_on))
         certs.append({
-            "name": c.name,
-            "id": c.id,
-            "expires_on": c.expires_on,
-            "created_on": c.created_on,
-            "updated_on": c.updated_on,
-            "enabled": c.enabled,
+            "name": prop.name,
+            "id": prop.id,
+            "domain": domain,
+            "issuer": issuer,
+            "expires_on": prop.expires_on.strftime("%Y-%m-%d %H:%M:%S") if prop.expires_on else "?",
+            "created_on": prop.created_on.strftime("%Y-%m-%d %H:%M:%S") if prop.created_on else "?",
+            "updated_on": prop.updated_on.strftime("%Y-%m-%d %H:%M:%S") if prop.updated_on else "?",
+            "enabled": prop.enabled,
+            "status_class": status_class
         })
 
     return templates.TemplateResponse("index.html", {"request": request, "certs": certs})

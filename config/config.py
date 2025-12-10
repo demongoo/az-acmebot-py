@@ -8,11 +8,17 @@ class Settings(BaseSettings):
 
     azure_credential: str = Field(default='default')
 
+    azure_subscription_id: str | None = Field(default=None)
+
     azure_keyvault_url: str
-
     renewal_days_before_expiry: int = Field(default=10)
-
     cert_pfx_password: str | None = Field(default=None)
+
+    dns_zone_resource_group: str | None = Field(default=None)
+    dns_zone_name: str | None = Field(default=None)
+
+    acme_email: str | None = Field(default=None)
+    acme_letsencrypt_email: str | None = Field(default=None)
 
     process_interval: int = Field(default=12*60)  # interval in minutes for processing
     process_first_run_delay: int = Field(default=0)  # delay in minutes before first run
