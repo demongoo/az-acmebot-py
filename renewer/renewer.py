@@ -1,10 +1,7 @@
 from datetime import datetime, timezone, timedelta
-from app.services.keyvault import keyvault_service
-from app.services.acme import acme_service
 from cryptography import x509
+from cryptography.hazmat._oid import NameOID
 from cryptography.hazmat.backends import default_backend
-from app.config import settings
-
 from loguru import logger
 
 from typing import Callable, Optional
@@ -14,56 +11,68 @@ from service.acme import ACMEService
 
 
 class CertRenewer:
-    def __init__(self, keyvault_service: KeyVaultService, dns_service: DNSService, acme_factory: Callable[[str], Optional[ACMEService]]):
+    def __init__(self, keyvault_service: KeyVaultService, dns_service: DNSService,
+                 acme_factory: Callable[[str], Optional[ACMEService]], pfx_password: str = None):
         self.keyvault_service = keyvault_service
         self.dns_service = dns_service
         self.acme_factory = acme_factory
+        self.pfx_password = pfx_password
 
     async def process_certificate(self, cert_prop, renewal_days_before_expiry: int):
         logger.info(f"Processing certificate: {cert_prop.name}")
 
         # Fetch the certificate bundle
-        cert_bundle = await keyvault_service.get_certificate(cert_prop.name)
+        cert_bundle = await self.keyvault_service.get_certificate(cert_prop.name)
         if not cert_bundle.cer:
-            logger.error(f"Certificate {cert_prop.name} has no CER content")
+            logger.error("No CER content, skipped")
             return
 
-        x509_cert = x509.load_der_x509_certificate(cert_bundle.cer, default_backend())
-        issuer = x509_cert.issuer.rfc4514_string()
-
-        if "Let's Encrypt" not in issuer:
-            print(f"Skipping {cert_prop.name}: Issuer is {issuer}")
-            return
-
+        # checking expiry
         expires_on = cert_prop.expires_on
         if not expires_on:
-            print(f"Skipping {cert_prop.name}: No expiry date.")
+            logger.warning(f"No expiry date, skipped")
             return
 
         days_until_expiry = (expires_on - datetime.now(timezone.utc)).days
-        print(f"Certificate {cert_prop.name} expires in {days_until_expiry} days.")
-
-        if days_until_expiry < 30:
-            print(f"Renewing {cert_prop.name}...")
-            await self.renew_certificate(cert_prop.name, x509_cert)
+        if days_until_expiry > 0:
+            logger.info(f"Expires in {days_until_expiry} days")
         else:
-            print(f"Certificate {cert_prop.name} is still valid.")
+            logger.warning(f"Expired {abs(days_until_expiry)} days ago")
 
-    async def check_and_renew_all(self):
-        print("Starting renewal check...")
-        certs = await keyvault_service.list_certificates()
+        if days_until_expiry > renewal_days_before_expiry:
+            logger.info(f"No need for renewal yet, skipped")
+            return
+
+        # get issuer to determine ACME provider
+        x509_cert = x509.load_der_x509_certificate(cert_bundle.cer, default_backend())
+        issuer = x509_cert.issuer
+        org_attributes = issuer.get_attributes_for_oid(NameOID.ORGANIZATION_NAME)
+        issuer_org_name = org_attributes[0].value if org_attributes else "Unknown"
+        logger.info(f"Issued by: {issuer_org_name}")
+
+        # Determine ACME service based on issuer
+        acme_service = self.acme_factory(issuer_org_name)
+        if not acme_service:
+            logger.warning(f"No ACME service configured for {issuer_org_name}, skipping")
+            return
+
+        # Trying to renew
+        logger.info(f"Attempting certificate renewal")
+
+
+    async def check_and_renew_all(self, renewal_days_before_expiry: int):
+        logger.info(f"Start renewal check for all certificates, renewal threshold: {renewal_days_before_expiry} days")
+        certs = await self.keyvault_service.list_certificates()
         for cert_prop in certs:
             try:
-                await self.process_certificate(cert_prop)
+                await self.process_certificate(cert_prop, renewal_days_before_expiry)
             except Exception as e:
-                print(f"Error processing certificate {cert_prop.name}: {e}")
-        print("Renewal check completed.")
-
+                logger.error(f"Error processing certificate {cert_prop.name}: {e}")
 
 
     async def renew_certificate(self, name: str, current_cert: x509.Certificate = None):
         if not current_cert:
-            cert_bundle = await keyvault_service.get_certificate(name)
+            cert_bundle = await self.keyvault_service.get_certificate(name)
             current_cert = x509.load_der_x509_certificate(cert_bundle.cer, default_backend())
             
         san_ext = current_cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
@@ -73,6 +82,6 @@ class CertRenewer:
         
         pfx_data = await acme_service.issue_certificate(sans)
         
-        await keyvault_service.import_certificate(name, pfx_data, password=settings.PFX_PASSWORD)
+        await keyvault_service.import_certificate(name, pfx_data, password=self.pfx_password)
         print(f"Successfully renewed and imported {name}")
 

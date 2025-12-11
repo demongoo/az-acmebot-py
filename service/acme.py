@@ -9,9 +9,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography import x509
 from cryptography.x509.oid import NameOID
 from cryptography.hazmat.primitives.serialization import pkcs12
-from app.config import settings
-from app.services.dns import dns_service
-
 
 async def _run_blocking(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
@@ -147,5 +144,3 @@ class ACMEService:
             encryption_algorithm=encryption
         )
         return pfx
-
-acme_service = ACMEService()

@@ -19,6 +19,7 @@ from cryptography.hazmat.backends import default_backend
 
 from config import settings
 from logger import logger
+from renewer.renewer import CertRenewer
 from service.acme import ACMEService
 from service.keyvault import KeyVaultService
 from service.dns import DNSService
@@ -58,7 +59,7 @@ else:
 
 # acme factory
 @cache
-def acme_provider_factory(acme_code: str) -> Optional[ACMEService]:
+def acme_by_code(acme_code: str) -> Optional[ACMEService]:
     match acme_code:
         case 'letsencrypt':
             acme_server = 'https://acme-v02.api.letsencrypt.org/directory'
@@ -74,15 +75,28 @@ def acme_provider_factory(acme_code: str) -> Optional[ACMEService]:
         logger.warning(f"ACME email not configured, cannot initialize provider {acme_code}")
         return None
 
-def acme_f
+def acme_factory(issuer: str) -> Optional[ACMEService]:
+    if "Let's Encrypt" in issuer:
+        return acme_by_code('letsencrypt')
+    else:
+        logger.warning(f"Unsupported issuer for ACME factory: {issuer}")
+        return None
+
+# initialize renewer processor
+renewer = CertRenewer(keyvault_service, dns_service, acme_factory, settings.cert_pfx_password)
+logger.info("Initialized Certificate Renewer")
+
+
+# renewal locking
+_renewal_lock = asyncio.Lock()
 
 # background task
 async def process_renewals():
     """
     Background task for renewals
     """
-    pass
-    #await processor.process()
+    async with _renewal_lock:
+        await renewer.check_and_renew_all(settings.renewal_days_before_expiry)
 
 
 # startup and shutdown events
@@ -92,11 +106,14 @@ async def lifespan(_: FastAPI):
 
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
-        process_renewals, "interval", coalesce=True,
+        process_renewals, "interval", coalesce=True, id="periodic_renewal_check",
         minutes=settings.process_interval,
         next_run_time=dt.now() + timedelta(minutes=settings.process_first_run_delay)
     )
     scheduler.start()
+
+    # Store in app state
+    app.state.scheduler = scheduler
 
     yield
 
@@ -187,7 +204,6 @@ async def root(request: Request, _: None = Depends(verify_credentials)):
         else:
             status_class = "unknown"
 
-        logger.debug(repr(prop.expires_on))
         certs.append({
             "name": prop.name,
             "id": prop.id,
@@ -201,3 +217,10 @@ async def root(request: Request, _: None = Depends(verify_credentials)):
         })
 
     return templates.TemplateResponse("index.html", {"request": request, "certs": certs})
+
+
+@app.post("/check-and-renew-all")
+async def check_and_renew_all(request: Request, _: None = Depends(verify_credentials)):
+    scheduler: AsyncIOScheduler = request.app.state.scheduler
+    scheduler.add_job(process_renewals, id="manual_renewal_check", replace_existing=True)
+    return RedirectResponse(url="/", status_code=303)
