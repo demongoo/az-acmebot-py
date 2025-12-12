@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 
-from azure.keyvault.certificates import CertificateProperties
+from azure.keyvault.certificates import CertificateProperties, KeyVaultCertificate
 from cryptography import x509
 from cryptography.hazmat._oid import NameOID
 from cryptography.hazmat.backends import default_backend
@@ -23,11 +23,12 @@ class CertRenewer:
         self.acme_factory = acme_factory
         self.pfx_password = pfx_password
 
-    async def process_certificate(self, cert_prop, renewal_days_before_expiry: int):
+    async def process_certificate(self, cert_prop, renewal_days_before_expiry: int, cert_bundle: Optional[KeyVaultCertificate] = None):
         logger.info(f"Processing certificate: {cert_prop.name}")
 
         # Fetch the certificate bundle
-        cert_bundle = await self.keyvault_service.get_certificate(cert_prop.name)
+        if cert_bundle is None:
+            cert_bundle = await self.keyvault_service.get_certificate(cert_prop.name)
         if not cert_bundle.cer:
             logger.error("No CER content, skipped")
             return
@@ -74,7 +75,16 @@ class CertRenewer:
                 await self.process_certificate(cert_prop, renewal_days_before_expiry)
             except Exception as e:
                 # log exception with stack trace
-                logger.exception(f"Error processing certificate {cert_prop.name}: {e}")
+                logger.error(f"Error processing certificate {cert_prop.name}: {e}")
+
+    async def renew_by_name(self, cert_name: str, renewal_days_before_expiry: int):
+        logger.info(f"Start renewal for certificate: {cert_name}")
+        cert = await self.keyvault_service.get_certificate(cert_name)
+        if not cert:
+            logger.error(f"Certificate {cert_name} not found in Key Vault")
+            return
+
+        await self.process_certificate(cert.properties, renewal_days_before_expiry, cert_bundle=cert)
 
     async def renew_certificate(self, cert_prop: CertificateProperties, current_cert: x509.Certificate, acme_service: ACMEService):
         logger.info(f'Renewing certificate: {cert_prop.name}')

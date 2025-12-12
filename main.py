@@ -224,3 +224,11 @@ async def check_and_renew_all(request: Request, _: None = Depends(verify_credent
     scheduler: AsyncIOScheduler = request.app.state.scheduler
     scheduler.add_job(process_renewals, id="manual_renewal_check", replace_existing=True)
     return RedirectResponse(url="/", status_code=303)
+
+
+@app.post("/renew/{cert_name}")
+async def renew_certificate(cert_name: str, request: Request, _: None = Depends(verify_credentials)):
+    async with _renewal_lock:
+        await renewer.renew_by_name(cert_name, settings.renewal_days_before_expiry)
+
+    return RedirectResponse(url="/", status_code=303)
