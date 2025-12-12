@@ -1,4 +1,4 @@
-import time
+from datetime import datetime, timedelta
 import asyncio
 import functools
 import josepy as jose
@@ -7,10 +7,17 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.x509 import CertificateSigningRequest
 from cryptography.x509.oid import NameOID
-from cryptography.hazmat.primitives.serialization import pkcs12
+from typing import Callable, TypeVar, ParamSpec, Awaitable
+from loguru import logger
 
-async def _run_blocking(func, *args, **kwargs):
+
+P = ParamSpec('P')
+R = TypeVar('R')
+
+async def _run_blocking(func: Callable[P, R], /,  *args: P.args, **kwargs: P.kwargs) -> R:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
@@ -27,91 +34,91 @@ class ACMEService:
             )
         )
         self.net = client.ClientNetwork(self.user_key, user_agent="az-acmebot-py/1.0")
-        self.acme_client = client.ClientV2(self.directory_url, self.net)
-        self._registered = False
-        self._temp_private_key = None
+        self.directory = client.ClientV2.get_directory(self.directory_url, self.net)
+        self.acme_client = client.ClientV2(self.directory, self.net)
+        self.__registered = False
 
-
-
-    async def _ensure_registration(self):
-        if not self._registered:
+    async def __ensure_registration(self):
+        if not self.__registered:
             def register():
                 try:
                     self.acme_client.new_account(
                         messages.NewRegistration.from_data(
-                            email=settings.ACME_EMAIL,
+                            email=self.acme_email,
                             terms_of_service_agreed=True
                         )
                     )
                 except messages.Error as e:
                     if e.code == 'urn:ietf:params:acme:error:accountDoesNotExist':
                         pass
+
                 return True
 
-            self._registered = await _run_blocking(register)
+            self.__registered = await _run_blocking(register)
 
-    async def issue_certificate(self, domains: list[str]) -> bytes:
-        await self._ensure_registration()
-        
-        order = await _run_blocking(self.acme_client.new_order, domains)
-        
+    async def issue_certificate(self, domains: list[str], dns_add_validation: Callable[[str, str], Awaitable[bool]]) -> tuple[bytes, RSAPrivateKey]:
+        logger.info(f'Issuing certificate for domains: {domains}')
+
+        logger.info("Ensuring registration with ACME server")
+        await self.__ensure_registration()
+
+        pk, csr = await _run_blocking(self.__generate_csr, domains)
+        logger.info(f'Generated CSR: CN={csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value}')
+
+        csr_pem = csr.public_bytes(serialization.Encoding.PEM)
+        order = await _run_blocking(self.acme_client.new_order, csr_pem)
+        logger.info(f'New order created')
+
         for authz in order.authorizations:
             if authz.body.status == messages.STATUS_VALID:
                 continue
-                
+
             domain = authz.body.identifier.value
             challenge = next(
                 c for c in authz.body.challenges if isinstance(c.chall, challenges.DNS01)
             )
-            
+
             response, validation = challenge.response_and_validation(self.acme_client.net.key)
-            
-            zone = settings.AZURE_ZONE_NAME
-            if zone and domain.endswith(zone):
-                relative_part = domain[:-len(zone)].strip('.')
-                if relative_part:
-                    record_name = f"_acme-challenge.{relative_part}"
-                else:
-                    record_name = "_acme-challenge"
-            else:
-                record_name = f"_acme-challenge.{domain}"
-            
-            await dns_service.create_txt_record(record_name, validation)
-            
-            print("Waiting for DNS propagation...")
-            await asyncio.sleep(30) 
-            
+
+            logger.info(f"Performing DNS-01 challenge for domain: {domain}, validation: {validation}")
+            validated = await dns_add_validation(domain, validation)
+            if not validated:
+                raise Exception(f"DNS validation failed for domain: {domain}")
+
+            logger.info("Waiting for DNS propagation")
+            await asyncio.sleep(30)
+
             await _run_blocking(self.acme_client.answer_challenge, challenge, response)
-            
-            # Polling
-            # We can't just block here. We should poll with async sleep.
-            finalized_authz = await self._poll_authz(authz)
+
+            # Polling for authorization status
+            async def poll_authz(authz):
+                wait_time = 120
+                poll_interval = 5
+                while wait_time > 0:
+                    authz, rsp = await _run_blocking(self.acme_client.poll, authz)
+                    if authz.body.status in (messages.STATUS_VALID, messages.STATUS_INVALID):
+                        return authz
+                    await asyncio.sleep(poll_interval)
+                    wait_time -= poll_interval
+
+                raise Exception('Authz polling timed out')
+
+            finalized_authz = await poll_authz(authz)
             if finalized_authz.body.status != messages.STATUS_VALID:
                 raise Exception(f"Authorization failed: {finalized_authz.body.status}")
-                
-            await dns_service.delete_txt_record(record_name)
 
-        csr_pem = await _run_blocking(self._generate_csr, domains)
-        order = await _run_blocking(self.acme_client.finalize_order, order, csr_pem)
-        
-        fullchain_pem = order.fullchain_pem.encode('utf-8')
-        return await _run_blocking(self.create_pfx, fullchain_pem)
+        logger.info("Finalizing order and obtaining certificate")
+        deadline = datetime.now() + timedelta(seconds=90)
+        order = await _run_blocking(self.acme_client.finalize_order, order, deadline)
 
-    async def _poll_authz(self, authz):
-        while True:
-            authz = await _run_blocking(self.acme_client.poll, authz)
-            if authz.body.status in (messages.STATUS_VALID, messages.STATUS_INVALID):
-                return authz
-            await asyncio.sleep(2)
+        return order.fullchain_pem.encode('utf-8'), pk
 
-    def _generate_csr(self, domains: list[str]) -> bytes:
+    def __generate_csr(self, domains: list[str]) -> tuple[RSAPrivateKey, CertificateSigningRequest]:
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=2048,
             backend=default_backend()
         )
-        
-        self._temp_private_key = private_key
         
         csr_builder = x509.CertificateSigningRequestBuilder()
         csr_builder = csr_builder.subject_name(x509.Name([
@@ -120,27 +127,8 @@ class ACMEService:
         
         csr_builder = csr_builder.add_extension(
             x509.SubjectAlternativeName([x509.DNSName(d) for d in domains]),
-            critical=False,
+            critical=False
         )
         
         csr = csr_builder.sign(private_key, hashes.SHA256(), default_backend())
-        return csr.public_bytes(serialization.Encoding.PEM)
-
-    def create_pfx(self, cert_chain_pem: bytes) -> bytes:
-        certs = x509.load_pem_x509_certificates(cert_chain_pem)
-        leaf = certs[0]
-        cas = certs[1:] if len(certs) > 1 else []
-        
-        if settings.PFX_PASSWORD:
-            encryption = serialization.BestAvailableEncryption(settings.PFX_PASSWORD.encode())
-        else:
-            encryption = serialization.NoEncryption()
-
-        pfx = pkcs12.serialize_key_and_certificates(
-            name=b"acmebot",
-            key=self._temp_private_key,
-            cert=leaf,
-            cas=cas,
-            encryption_algorithm=encryption
-        )
-        return pfx
+        return private_key, csr

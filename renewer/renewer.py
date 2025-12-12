@@ -1,7 +1,12 @@
 from datetime import datetime, timezone, timedelta
+
+from azure.keyvault.certificates import CertificateProperties
 from cryptography import x509
 from cryptography.hazmat._oid import NameOID
 from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.serialization import pkcs12
 from loguru import logger
 
 from typing import Callable, Optional
@@ -58,6 +63,7 @@ class CertRenewer:
 
         # Trying to renew
         logger.info(f"Attempting certificate renewal")
+        await self.renew_certificate(cert_prop, x509_cert, acme_service)
 
 
     async def check_and_renew_all(self, renewal_days_before_expiry: int):
@@ -67,21 +73,63 @@ class CertRenewer:
             try:
                 await self.process_certificate(cert_prop, renewal_days_before_expiry)
             except Exception as e:
-                logger.error(f"Error processing certificate {cert_prop.name}: {e}")
+                # log exception with stack trace
+                logger.exception(f"Error processing certificate {cert_prop.name}: {e}")
 
+    async def renew_certificate(self, cert_prop: CertificateProperties, current_cert: x509.Certificate, acme_service: ACMEService):
+        logger.info(f'Renewing certificate: {cert_prop.name}')
 
-    async def renew_certificate(self, name: str, current_cert: x509.Certificate = None):
-        if not current_cert:
-            cert_bundle = await self.keyvault_service.get_certificate(name)
-            current_cert = x509.load_der_x509_certificate(cert_bundle.cer, default_backend())
-            
+        # extracting domains from current cert
         san_ext = current_cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
         sans = san_ext.value.get_values_for_type(x509.DNSName)
+        logger.info(f"Domains: {sans}")
+
+        async def add_validation_record(domain: str, validation: str) -> bool:
+            if not self.dns_service:
+                logger.error("No DNS service configured for DNS-01 challenge")
+                return False
+
+            zone = self.dns_service.zone_name
+            if domain.endswith(zone):
+                relative_part = domain[:-len(zone)].strip('.')
+                if relative_part:
+                    record_name = f"_acme-challenge.{relative_part}"
+                else:
+                    record_name = "_acme-challenge"
+            else:
+                record_name = f"_acme-challenge.{domain}"
+
+            logger.info(f"Creating TXT record {record_name} with value {validation}")
+            await self.dns_service.create_txt_record(record_name, validation)
+            return True
         
-        print(f"Renewing for domains: {sans}")
-        
-        pfx_data = await acme_service.issue_certificate(sans)
-        
-        await keyvault_service.import_certificate(name, pfx_data, password=self.pfx_password)
-        print(f"Successfully renewed and imported {name}")
+        full_chain_pem, private_key = await acme_service.issue_certificate(sans, add_validation_record)
+
+        # creating pfx
+        logger.info('Creating PFX package')
+        pfx_data = self.create_pfx(cert_prop.name, full_chain_pem, private_key, self.pfx_password)
+
+        # importing to Key Vault
+        logger.info('Importing renewed certificate to Key Vault')
+        await self.keyvault_service.import_certificate(cert_prop.name, pfx_data, password=self.pfx_password)
+
+    def create_pfx(self, name: str, full_chain_pem: bytes, private_key: RSAPrivateKey, password: str = None) -> bytes:
+        certs = x509.load_pem_x509_certificates(full_chain_pem)
+        leaf = certs[0]
+        cas = certs[1:] if len(certs) > 1 else []
+
+        if password:
+            encryption = serialization.BestAvailableEncryption(password.encode())
+        else:
+            encryption = serialization.NoEncryption()
+
+        data = pkcs12.serialize_key_and_certificates(
+            name=name.encode('utf-8'),
+            key=private_key,
+            cert=leaf,
+            cas=cas,
+            encryption_algorithm=encryption
+        )
+        return data
+
 
