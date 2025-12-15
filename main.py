@@ -34,7 +34,7 @@ match settings.azure_credential:
         azure_credential = DefaultAzureCredential()
     case 'managed_identity':
         from azure.identity.aio import ManagedIdentityCredential
-        azure_credential = ManagedIdentityCredential()
+        azure_credential = ManagedIdentityCredential(client_id=settings.azure_managed_identity_client_id)
     case _:
         logger.error(f"Invalid azure_credential setting: {settings.azure_credential}")
         raise ValueError(f"Invalid azure_credential setting: {settings.azure_credential}")

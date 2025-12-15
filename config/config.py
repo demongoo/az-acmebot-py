@@ -8,6 +8,8 @@ class Settings(BaseSettings):
 
     azure_credential: str = Field(default='default')
 
+    azure_managed_identity_client_id: str | None = Field(default=None)
+
     azure_subscription_id: str | None = Field(default=None)
 
     azure_keyvault_url: str
