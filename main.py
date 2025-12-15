@@ -159,8 +159,6 @@ async def healthcheck() -> dict[str, str]:
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request, _: None = Depends(verify_credentials)):
-    await dns_service.create_txt_record("test.blabla", "blablabla")
-
     certs_props = await keyvault_service.list_certificates()
 
     # Fetch full details for all certificates in parallel
